@@ -219,5 +219,9 @@ def main():
     elapsed = time.time() - start_time
     print(f"All done in {elapsed:.2f}s. Processed {len(all_data)} total items.")
 
-if __name__ == '__main__':
+def lambda_function(event, context):
     main()
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Lambda function executed successfully')
+    }
