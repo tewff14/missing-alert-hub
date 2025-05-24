@@ -45,13 +45,16 @@ def remove_thai_honorific(name):
     if not name:
         return 'ไม่ระบุ'
     
-    honorifics = ['นาย', 'นาง', 'นางสาว', 'ด.ช.', 'ด.ญ.', 'เด็กชาย', 'เด็กหญิง']
+    honorifics = ['นาย','นางสาว', 'นาง', 'ด.ช.', 'ด.ญ.', 'เด็กชาย', 'เด็กหญิง']
     processed_name = name.strip()
     
     for honorific in honorifics:
         if processed_name.startswith(honorific):
             processed_name = processed_name[len(honorific):].strip()
             break
+    
+    # Normalize spaces - replace multiple spaces with a single space
+    processed_name = ' '.join(processed_name.split())
     
     return processed_name or 'ไม่ระบุ'
 
@@ -68,6 +71,57 @@ def store_items_in_db(items):
     
     try:
         with conn.cursor() as cur:
+            # Get all existing case IDs and names for this platform
+            existing_cases_sql = """
+            SELECT c.id, c.name 
+            FROM cases c
+            JOIN case_information ci ON c.id = ci.case_id
+            WHERE ci.platform = 'thaimissing'
+            """
+            cur.execute(existing_cases_sql)
+            existing_cases = cur.fetchall()
+            
+            # Create a set of new case names for comparison
+            new_case_names = {remove_thai_honorific(item['full_name']) for item in items}
+            
+            # Find cases to mark as inactive (those that don't exist in new data)
+            cases_to_mark = [
+                case['id'] for case in existing_cases 
+                if case['name'] not in new_case_names
+            ]
+            
+            # Mark cases as inactive by updating case_information
+            if cases_to_mark:
+                update_sql = """
+                UPDATE case_information 
+                SET description = CONCAT(COALESCE(description, ''), '\n[INACTIVE - No longer found in source]'),
+                    created_at = NOW()
+                WHERE case_id IN %(case_ids)s AND platform = 'thaimissing'
+                """
+                cur.execute(update_sql, {'case_ids': tuple(cases_to_mark)})
+                print(f"Marked {len(cases_to_mark)} old cases as inactive")
+                
+                # Delete marked cases from case_information
+                delete_marked_sql = """
+                DELETE FROM case_information 
+                WHERE case_id IN %(case_ids)s AND platform = 'thaimissing'
+                """
+                cur.execute(delete_marked_sql, {'case_ids': tuple(cases_to_mark)})
+                print(f"Deleted {len(cases_to_mark)} marked cases from case_information")
+                
+                # Find and delete orphaned cases (cases with no case_information)
+                delete_orphaned_sql = """
+                DELETE FROM cases 
+                WHERE id IN %(case_ids)s 
+                AND NOT EXISTS (
+                    SELECT 1 FROM case_information 
+                    WHERE case_id = cases.id
+                )
+                """
+                cur.execute(delete_orphaned_sql, {'case_ids': tuple(cases_to_mark)})
+                print(f"Deleted orphaned cases from cases table")
+            
+            # Process new items
             for item in items:
                 cleaned_name = remove_thai_honorific(item['full_name'])
                 
@@ -143,7 +197,22 @@ def store_items_in_db(items):
                     })
                     print(f"Added new case information for platform 'thaimissing' for case ID {case_id}")
                 else:
-                    print(f"Case information for platform 'thaimissing' already exists for case ID {case_id}, skipping...")
+                    # Update existing case information
+                    update_sql = """
+                    UPDATE case_information 
+                    SET picture = %(picture)s,
+                        url = %(url)s,
+                        description = %(description)s,
+                        created_at = NOW()
+                    WHERE case_id = %(case_id)s AND platform = 'thaimissing'
+                    """
+                    cur.execute(update_sql, {
+                        'case_id': case_id,
+                        'picture': item['photo_url'],
+                        'url': item['source_url'],
+                        'description': description
+                    })
+                    print(f"Updated existing case information for platform 'thaimissing' for case ID {case_id}")
 
         conn.commit()
         print(f"Successfully stored {len(items)} items in database")

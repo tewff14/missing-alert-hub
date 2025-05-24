@@ -73,19 +73,7 @@ def fetch_and_process_page(page):
             'image_url': image_url
         })
     
-    # Fetch details for all items on this page concurrently
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_detail, item): item for item in items}
-        for future in futures:
-            try:
-                future.result()
-            except Exception as e:
-                print(f"Error processing item: {e}")
-    
-    # Store results in database
-    store_items_in_db(items)
-    
-    print(f"Page {page}: processed {len(items)} listings")
+    print(f"Page {page}: found {len(items)} listings")
     return items
 
 def fetch_detail(item):
@@ -123,13 +111,16 @@ def remove_thai_honorific(name):
     if not name:
         return 'ไม่ระบุ'
     
-    honorifics = ['นาย', 'นาง', 'นางสาว', 'ด.ช.', 'ด.ญ.', 'เด็กชาย', 'เด็กหญิง']
+    honorifics = ['นาย','นางสาว', 'นาง', 'ด.ช.', 'ด.ญ.', 'เด็กชาย', 'เด็กหญิง']
     processed_name = name.strip()
     
     for honorific in honorifics:
         if processed_name.startswith(honorific):
             processed_name = processed_name[len(honorific):].strip()
             break
+    
+    # Normalize spaces - replace multiple spaces with a single space
+    processed_name = ' '.join(processed_name.split())
     
     return processed_name or 'ไม่ระบุ'
 
@@ -142,6 +133,62 @@ def store_items_in_db(items):
     
     try:
         with conn.cursor() as cur:
+            # Get all existing case IDs and names for this platform
+            existing_cases_sql = """
+            SELECT c.id, c.name 
+            FROM cases c
+            JOIN case_information ci ON c.id = ci.case_id
+            WHERE ci.platform = 'backtohome'
+            """
+            cur.execute(existing_cases_sql)
+            existing_cases = cur.fetchall()
+            print(f"Found {len(existing_cases)} existing cases in database")
+            
+            # Create a set of new case names for comparison
+            new_case_names = {remove_thai_honorific(item['name']) for item in items}
+            print(f"Found {len(new_case_names)} new cases from source")
+            
+            # Find cases to mark as inactive (those that don't exist in new data)
+            cases_to_mark = []
+            for case in existing_cases:
+                if case['name'] not in new_case_names:
+                    cases_to_mark.append(case['id'])
+                    print(f"Case {case['id']} with name '{case['name']}' not found in new data")
+            
+            print(f"Found {len(cases_to_mark)} cases to mark as inactive")
+            
+            # Mark cases as inactive by updating case_information
+            if cases_to_mark:
+                update_sql = """
+                UPDATE case_information 
+                SET description = CONCAT(COALESCE(description, ''), '\n[INACTIVE - No longer found in source]'),
+                    created_at = NOW()
+                WHERE case_id IN %(case_ids)s AND platform = 'backtohome'
+                """
+                cur.execute(update_sql, {'case_ids': tuple(cases_to_mark)})
+                print(f"Marked {len(cases_to_mark)} old cases as inactive")
+                
+                # Delete marked cases from case_information
+                delete_marked_sql = """
+                DELETE FROM case_information 
+                WHERE case_id IN %(case_ids)s AND platform = 'backtohome'
+                """
+                cur.execute(delete_marked_sql, {'case_ids': tuple(cases_to_mark)})
+                print(f"Deleted {len(cases_to_mark)} marked cases from case_information")
+                
+                # Find and delete orphaned cases (cases with no case_information)
+                delete_orphaned_sql = """
+                DELETE FROM cases 
+                WHERE id IN %(case_ids)s 
+                AND NOT EXISTS (
+                    SELECT 1 FROM case_information 
+                    WHERE case_id = cases.id
+                )
+                """
+                cur.execute(delete_orphaned_sql, {'case_ids': tuple(cases_to_mark)})
+                print(f"Deleted orphaned cases from cases table")
+            
+            # Process new items
             for item in items:
                 cleaned_name = remove_thai_honorific(item['name'])
                 
@@ -196,7 +243,32 @@ def store_items_in_db(items):
                     })
                     print(f"Added new case information for platform 'backtohome' for case ID {case_id}")
                 else:
-                    print(f"Case information for platform 'backtohome' already exists for case ID {case_id}, skipping...")
+                    # Update existing case information
+                    update_sql = """
+                    UPDATE case_information 
+                    SET picture = %(picture)s,
+                        url = %(url)s,
+                        description = %(description)s,
+                        created_at = NOW()
+                    WHERE case_id = %(case_id)s 
+                    AND platform = 'backtohome'
+                    AND (
+                        picture != %(picture)s 
+                        OR url != %(url)s 
+                        OR description != %(description)s
+                    )
+                    """
+                    cur.execute(update_sql, {
+                        'case_id': case_id,
+                        'platform': 'backtohome',
+                        'picture': item['image_url'],
+                        'url': item['detail_link'],
+                        'description': item.get('detail')
+                    })
+                    if cur.rowcount > 0:
+                        print(f"Updated existing case information for platform 'backtohome' for case ID {case_id}")
+                    else:
+                        print(f"No changes needed for case ID {case_id}")
 
         conn.commit()
         print(f"Successfully stored {len(items)} items in database")
@@ -211,15 +283,30 @@ def main():
     total_pages = get_total_pages()
     print(f"Total pages to process: {total_pages}")
     
-    # Process all pages concurrently
+    # First, collect all items from all pages
+    all_items = []
     with ThreadPoolExecutor(max_workers=5) as executor:
-        all_items = list(executor.map(fetch_and_process_page, range(1, total_pages + 1)))
+        page_items = list(executor.map(fetch_and_process_page, range(1, total_pages + 1)))
+        all_items = [item for page_items in page_items for item in page_items]
     
-    all_data = [item for page_items in all_items for item in page_items]
+    print(f"Collected {len(all_items)} total items from all pages")
+    
+    # Then, fetch details for all items
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_detail, item): item for item in all_items}
+        for future in futures:
+            try:
+                future.result()
+            except Exception as e:
+                print(f"Error processing item: {e}")
+    
+    # Finally, store all items in database at once
+    store_items_in_db(all_items)
+    
     elapsed = time.time() - start_time
-    print(f"All done in {elapsed:.2f}s. Processed {len(all_data)} total items.")
+    print(f"All done in {elapsed:.2f}s. Processed {len(all_items)} total items.")
 
-def lambda_function(event, context):
+def lambda_handler(event, context):
     main()
     return {
         'statusCode': 200,
